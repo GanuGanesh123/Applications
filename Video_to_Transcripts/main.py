@@ -1,231 +1,138 @@
-"""
-Main FastAPI application entry point.
-"""
-import logging
-from contextlib import asynccontextmanager
-from typing import Dict, Any
-
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.staticfiles import StaticFiles
-from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import os
+import uuid
+import pandas as pd
+from pathlib import Path
 
-from app.core.config import settings
-from app.utils.logging_config import setup_logging
-from app.utils.exceptions import TranscriptAPIException
-from app.api.routes import transcripts_router, health_router, files_router
+# Initialize FastAPI app
+app = FastAPI(title="Video to Transcript API")
 
-# Set up logging
-setup_logging()
-logger = logging.getLogger(__name__)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan events."""
-    # Startup
-    logger.info(f"Starting {settings.app_name} v{settings.app_version}")
-    logger.info(f"Debug mode: {settings.debug}")
-    logger.info(f"Output directory: {settings.output_directory}")
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down application")
-
-
-# Create FastAPI application
-app = FastAPI(
-    title=settings.app_name,
-    version=settings.app_version,
-    description="""
-    YouTube Transcript API - Extract and convert YouTube video transcripts to various formats.
-    
-    ## Features
-    
-    * Extract transcripts from YouTube videos
-    * Support for multiple languages
-    * Export to TXT, PDF, and JSON formats
-    * Background processing for large videos
-    * File management and cleanup
-    * Health monitoring and system status
-    
-    ## Usage
-    
-    1. **Quick Transcript**: Use `/api/v1/transcripts/quick` for immediate text extraction
-    2. **Full Processing**: Use `/api/v1/transcripts/` to generate files with metadata
-    3. **Async Processing**: Use `/api/v1/transcripts/async` for background processing
-    4. **File Management**: Use `/api/v1/files/` endpoints to manage generated files
-    
-    ## Rate Limits
-    
-    * 50 requests per hour per IP address
-    * Larger videos may take longer to process
-    
-    ## Supported URLs
-    
-    * https://www.youtube.com/watch?v=VIDEO_ID
-    * https://youtu.be/VIDEO_ID
-    * https://m.youtube.com/watch?v=VIDEO_ID
-    * https://www.youtube.com/embed/VIDEO_ID
-    """,
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-    lifespan=lifespan
-)
-
-# Add middleware
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_hosts,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=settings.allowed_hosts
-)
+# Create necessary directories
+UPLOAD_DIR = Path("uploads")
+OUTPUT_DIR = Path("outputs")
+UPLOAD_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
 
+# =====================
+# API ROUTES
+# =====================
 
-# Custom exception handlers
-@app.exception_handler(TranscriptAPIException)
-async def transcript_api_exception_handler(request: Request, exc: TranscriptAPIException):
-    """Handle custom transcript API exceptions."""
-    logger.error(f"TranscriptAPIException: {exc.message}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": exc.__class__.__name__,
-            "message": exc.message,
-            "status_code": exc.status_code
-        }
-    )
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint for keeping app awake"""
+    return {"status": "healthy", "message": "Server is running"}
 
+@app.post("/api/upload")
+async def upload_video(file: UploadFile = File(...)):
+    """Upload video file endpoint"""
+    try:
+        # Validate file type
+        if not file.content_type.startswith('video/'):
+            raise HTTPException(status_code=400, detail="File must be a video")
+        
+        # Generate unique filename
+        file_id = str(uuid.uuid4())
+        file_extension = os.path.splitext(file.filename)[1]
+        filename = f"{file_id}{file_extension}"
+        file_path = UPLOAD_DIR / filename
+        
+        # Save file
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        
+        return JSONResponse({
+            "success": True,
+            "job_id": file_id,
+            "filename": file.filename,
+            "message": "Video uploaded successfully. Transcription will begin shortly."
+        })
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle request validation errors."""
-    logger.warning(f"Validation error: {exc.errors()}")
-    return JSONResponse(
-        status_code=422,
-        content={
-            "error": "ValidationError",
-            "message": "Request validation failed",
-            "details": exc.errors()
-        }
-    )
-
-
-@app.exception_handler(StarletteHTTPException)
-async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    """Handle HTTP exceptions."""
-    logger.warning(f"HTTP {exc.status_code}: {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": "HTTPException",
-            "message": exc.detail,
-            "status_code": exc.status_code
-        }
-    )
-
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    """Handle unexpected exceptions."""
-    logger.error(f"Unexpected error: {str(exc)}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "InternalServerError",
-            "message": "An unexpected error occurred" if not settings.debug else str(exc),
-            "status_code": 500
-        }
-    )
-
-
-# Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Include routers
-app.include_router(
-    transcripts_router,
-    prefix=settings.api_v1_prefix
-)
-
-app.include_router(
-    health_router,
-    prefix=settings.api_v1_prefix
-)
-
-app.include_router(
-    files_router,
-    prefix=settings.api_v1_prefix
-)
-
-
-# Root endpoint
-@app.get("/", response_model=Dict[str, Any])
-async def root() -> Dict[str, Any]:
-    """Root endpoint with API information."""
+@app.get("/api/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    """Check transcription job status"""
+    # This is a placeholder - you'll implement actual status checking later
     return {
-        "name": settings.app_name,
-        "version": settings.app_version,
-        "description": "YouTube Transcript API - Extract and convert video transcripts",
-        "docs_url": "/docs",
-        "health_check": "/api/v1/health",
-        "endpoints": {
-            "transcripts": "/api/v1/transcripts",
-            "files": "/api/v1/files",
-            "health": "/api/v1/health"
-        }
+        "job_id": job_id,
+        "status": "processing",
+        "progress": 50,
+        "message": "Transcription in progress..."
     }
 
-
-# Additional metadata endpoint
-@app.get("/info", response_model=Dict[str, Any])
-async def app_info() -> Dict[str, Any]:
-    """Get detailed application information."""
+@app.get("/api/transcript/{job_id}")
+async def get_transcript(job_id: str):
+    """Get completed transcript"""
+    # This is a placeholder - you'll implement actual transcript retrieval later
+    transcript_file = OUTPUT_DIR / f"{job_id}.txt"
+    
+    if not transcript_file.exists():
+        raise HTTPException(status_code=404, detail="Transcript not found")
+    
+    with open(transcript_file, "r") as f:
+        content = f.read()
+    
     return {
-        "application": {
-            "name": settings.app_name,
-            "version": settings.app_version,
-            "debug": settings.debug
-        },
-        "configuration": {
-            "output_directory": settings.output_directory,
-            "max_file_size_mb": settings.max_file_size // (1024 * 1024),
-            "default_languages": settings.default_languages,
-            "pdf_settings": {
-                "page_size": settings.pdf_page_size,
-                "font_size": settings.pdf_font_size,
-                "margins": settings.pdf_margins
-            }
-        },
-        "features": [
-            "YouTube transcript extraction",
-            "Multiple output formats (TXT, PDF, JSON)",
-            "Multi-language support",
-            "Background processing",
-            "File management",
-            "Health monitoring"
-        ]
+        "job_id": job_id,
+        "transcript": content,
+        "status": "completed"
     }
 
+# =====================
+# SERVE FRONTEND
+# =====================
+
+# Mount static files (CSS, JS, images, etc.)
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+
+# Serve index.html for root and any non-API routes
+@app.get("/{full_path:path}")
+async def serve_frontend(full_path: str):
+    """Serve frontend for all non-API routes"""
+    
+    # Don't interfere with API routes
+    if full_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API endpoint not found")
+    
+    # Serve index.html
+    index_path = "static/index.html"
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    else:
+        return {"message": "Frontend not found. Please ensure static/index.html exists."}
+
+# Root endpoint - serves index.html
+@app.get("/")
+async def read_root():
+    """Serve the main page"""
+    index_path = "static/index.html"
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    else:
+        return {
+            "message": "Video to Transcript API",
+            "docs": "/docs",
+            "health": "/api/health"
+        }
 
 if __name__ == "__main__":
     import uvicorn
-    
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=settings.debug,
-        log_level="debug" if settings.debug else "info"
-    )
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# let go to render
